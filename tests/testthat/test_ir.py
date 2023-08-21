@@ -5,14 +5,10 @@ import os
 import sys
 from pathlib import Path
 
-HERE = Path(__file__).parent
-sys.path.insert(0, str(HERE / 'jkt'))
-
 import unittest
-import jupyter_kernel_test as jkt
 
 from jupyter_client.manager import start_new_kernel
-from jupyter_kernel_test import validate_message
+from jupyter_kernel_test import validate_message, KernelTests
 
 
 without_rich_display = '''\
@@ -26,7 +22,7 @@ options(jupyter.rich_display = TRUE)
 TIMEOUT = 15
 
 
-class IRkernelTests(jkt.KernelTests):
+class IRkernelTests(KernelTests):
     kernel_name = os.environ.get('IR_KERNEL_NAME', 'testir')
 
     language_name = 'R'
@@ -267,67 +263,83 @@ class IRkernelTests(jkt.KernelTests):
         self.assertEqual(execution_count_1, execution_count_2)
         self.assertEqual(execution_count_1, execution_count_3)
 
+    irkernel_inspects = [
+        dict(name='Numeric constant', token='1'),
+        # dict(name='Reserved word', token='NULL'),  # null is not an object anymore?
+        dict(name='Dataset with a help document', token='iris'),
+        dict(name='Function with a help document', token='c'),
+        dict(name='Function name with namespace', token='base::c'),
+        dict(name='Function not exported from namespace', token='tools:::.Rd2pdf'),
+        dict(name='User-defined variable', token='x', vars=dict(x='1')),
+        dict(name='User-defined function', token='f', vars=dict(f='function (x) x + x')),
+        dict(name='Object which masks other object in workspace', token='c', vars=dict(c='function (x) x + x')),
+    ]
+
     def test_irkernel_inspects(self):
-        """Test if object inspection works."""
+        """Test if object inspection works.
+
+        Checks if inspect_request for rach `token` returns a reply.
+
+        Currently just test if the kernel replys without an error and not care about its content.
+        Because the contents of inspections are still so arguable.
+        When the requirements for the contents are decided, fix the tests and check the contents.
+        """
         self.flush_channels()
 
-        def test_token_is_ok(token, preprocess=None, postprocess=None):
-            """Check if inspect_request for the `token` returns a reply.
+        for sample in self.irkernel_inspects:
+            with self.subTest(text=sample["name"]):
+                for var_name, var_code in sample.get('vars', {}).items():
+                    self._execute_code(f'{var_name} <- {var_code}', tests=False)
+    
+                msg_id = self.kc.inspect(sample["token"])
+                reply = self.kc.get_shell_msg(timeout=TIMEOUT)
+                validate_message(reply, 'inspect_reply', msg_id)
+    
+                self.assertEqual(reply['content']['status'], 'ok')
+                self.assertTrue(reply['content']['found'])
+                self.assertGreaterEqual(len(reply['content']['data']), 1)
+    
+                for var_name in sample.get('vars', {}):
+                    self._execute_code(f'rm("{var_name}")', tests=False)
 
-            Run code in `preprocess` before requesting if it's given,
-            and `proprocess` after requesting.
+    non_syntactic_completion_samples = [
+        dict(text='xx$host[[1]]$h',
+             matches=['xx$host[[1]]$h1', 'xx$host[[1]]$h2'],
+             vars=dict(xx='list(host = list(list(h1 = 1, h2 = 2), list(h3 = 3, h4 = 4)))')),
+        dict(text='odd_named_list$a',
+             matches=['odd_named_list$a'],
+             vars=dict(odd_named_list=r'list(a = 1, b = 2, `b c` = 3, `\`\\\`` = 4, 5)')),
+        dict(text='odd_named_list$b',
+             matches=['odd_named_list$b', 'odd_named_list$`b c`'],
+             vars=dict(odd_named_list=r'list(a = 1, b = 2, `b c` = 3, `\`\\\`` = 4, 5)')),
+        dict(text='odd_named_list$',
+             matches=['odd_named_list$a', 'odd_named_list$b', 'odd_named_list$`b c`', r'odd_named_list$`\`\\\``', 'odd_named_list$'],
+             vars=dict(odd_named_list=r'list(a = 1, b = 2, `b c` = 3, `\`\\\`` = 4, 5)')),
+        dict(text='arith_named_env$a',
+             matches=['arith_named_env$`abc+def`', 'arith_named_env$`abc-def`'],
+             vars=dict(arith_named_env='list2env(list(`abc+def` = 1, `def-abc` = 2, `abc-def` = 3, defabc = 4))')),
+        dict(text='arith_named_env$def',
+             matches=['arith_named_env$`def-abc`', 'arith_named_env$defabc'],
+             vars=dict(arith_named_env='list2env(list(`abc+def` = 1, `def-abc` = 2, `abc-def` = 3, defabc = 4))')),
+        dict(text='arith_named_env$',
+             matches=['arith_named_env$`abc+def`', 'arith_named_env$`def-abc`', 'arith_named_env$`abc-def`', 'arith_named_env$defabc'],
+             vars=dict(arith_named_env='list2env(list(`abc+def` = 1, `def-abc` = 2, `abc-def` = 3, defabc = 4))')),
+    ]
 
-            Currently just test if the kernel replys without an error
-            and not care about its content.
-            Because the contents of inspections are still so arguable.
-            When the requirements for the contents are decided,
-            fix the tests beow and check the contents.
-            """
-            if preprocess:
-                self._execute_code(preprocess, tests=False)
+    def test_non_syntactic_completions(self):
+        """Test tab-completion for non-syntactic names which require setup/teardown"""
 
-            msg_id = self.kc.inspect(token)
-            reply = self.kc.get_shell_msg(timeout=TIMEOUT)
-            validate_message(reply, 'inspect_reply', msg_id)
+        for sample in self.non_syntactic_completion_samples:
+            with self.subTest(text=sample['text']):
+                for var_name, var_value in sample['vars'].items():
+                    self._execute_code(f'{var_name} <- {var_value}', tests=False)
+                msg_id = self.kc.complete(sample['text'])
+                reply = self.get_non_kernel_info_reply()
+                validate_message(reply, 'complete_reply', msg_id)
+                self.assertEqual(set(reply['content']['matches']), set(sample['matches']))
 
-            self.assertEqual(reply['content']['status'], 'ok')
-            self.assertTrue(reply['content']['found'])
-            self.assertGreaterEqual(len(reply['content']['data']), 1)
-
-            if postprocess:
-                self._execute_code(postprocess, tests=False)
-
-        # Numeric constant
-        test_token_is_ok('1')
-        # Reserved word
-        # test_token_is_ok('NULL')  # null is not an object anymore?
-        # Dataset with a help document
-        test_token_is_ok('iris')
-        # Function with a help document
-        test_token_is_ok('c')
-        # Function name with namespace
-        test_token_is_ok('base::c')
-        # Function not exported from namespace
-        test_token_is_ok('tools:::.Rd2pdf')
-        # User-defined variable
-        test_token_is_ok(
-            'x',
-            preprocess='x <- 1',
-            postprocess='rm("x")'
-        )
-        # User-defined function
-        test_token_is_ok(
-            'f',
-            preprocess='f <- function (x) x + x',
-            postprocess='rm("f")'
-        )
-        # Object which masks other object in workspace
-        test_token_is_ok(
-            'c',
-            preprocess='c <- function (x) x + x',
-            postprocess='rm("c")'
-        )
-
+                for var_name in sample['vars']:
+                    self._execute_code(f'rm({var_name})', tests=False)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
